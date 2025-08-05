@@ -12,6 +12,7 @@ SUCCESS_LOG="pokemon_parallel_success.log"
 MAX_RETRIES=3
 RETRY_DELAY=2
 MAX_PARALLEL_JOBS=5
+JOB_TIMEOUT=60
 
 # Create the data directory if it doesn't exist
 if [ ! -d "$DATA_DIR" ]; then
@@ -168,13 +169,42 @@ check_network() {
     fi
 }
 
+# Function to kill stuck processes after timeout
+kill_stuck_processes() {
+    local job_pids=("$@")
+    local start_time=$1
+    shift
+    job_pids=("$@")
+
+    local current_time=$(date +%s)
+    local elapsed=$((current_time - start_time))
+
+    if [ $elapsed -gt $JOB_TIMEOUT ]; then
+        log_error "Timeout reached ($JOB_TIMEOUT seconds), killing stuck processes" "MAIN"
+        for pid in "${job_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log_error "Killing stuck process PID: $pid" "MAIN"
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 2
+                if kill -0 "$pid" 2>/dev/null; then
+                    log_error "Force killing process PID: $pid" "MAIN"
+                    kill -KILL "$pid" 2>/dev/null || true
+                fi
+            fi
+        done
+        return 1
+    fi
+    return 0
+}
+
 # Function to wait for all background jobs to complete
 wait_for_jobs() {
     local job_pids=("$@")
     local completed=0
     local total=${#job_pids[@]}
+    local start_time=$(date +%s)
 
-    log_info "Waiting for $total parallel jobs to complete" "MAIN"
+    log_info "Waiting for $total parallel jobs to complete (timeout: ${JOB_TIMEOUT}s)" "MAIN"
 
     # Show progress while waiting
     while [ $completed -lt $total ]; do
@@ -190,14 +220,30 @@ wait_for_jobs() {
         done
 
         if [ $completed -lt $total ]; then
-            echo "Progress: $completed/$total jobs completed. Waiting..."
-            sleep 2
+            # Check for timeout and kill stuck processes if needed
+            if kill_stuck_processes $start_time "${job_pids[@]}"; then
+                echo "Progress: $completed/$total jobs completed. Waiting..."
+                sleep 2
+            else
+                log_error "Timeout exceeded, terminating remaining jobs" "MAIN"
+                break
+            fi
         fi
     done
 
-    # Wait for all background processes to finish properly
+    # Wait for all background processes to finish properly or kill them
     for pid in "${job_pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
+        if kill -0 "$pid" 2>/dev/null; then
+            # Process still running, wait briefly then force kill
+            wait "$pid" 2>/dev/null || true &
+            local wait_pid=$!
+            sleep 3
+            if kill -0 "$wait_pid" 2>/dev/null; then
+                kill -KILL "$wait_pid" 2>/dev/null || true
+                log_error "Force killed waiting process for PID: $pid" "MAIN"
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
     done
 
     log_info "All parallel jobs completed" "MAIN"
@@ -254,10 +300,33 @@ display_statistics() {
     rm -f "$DATA_DIR"/*.status
 }
 
+# Function to cleanup and kill all processes on exit
+cleanup_processes() {
+    log_info "Cleaning up background processes..." "MAIN"
+
+    # Kill any remaining background jobs
+    for pid in $(jobs -p); do
+        if kill -0 "$pid" 2>/dev/null; then
+            log_info "Terminating background process PID: $pid" "MAIN"
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    # Clean up status files
+    rm -f "$DATA_DIR"/*.status 2>/dev/null || true
+}
+
 # Function to control parallel job execution
 manage_parallel_jobs() {
     local job_pids=()
     local running_jobs=0
+
+    # Set up cleanup trap
+    trap cleanup_processes EXIT INT TERM
 
     for pokemon in "${POKEMON_LIST[@]}"; do
         # Wait if we've reached the maximum number of parallel jobs
@@ -265,7 +334,7 @@ manage_parallel_jobs() {
             log_info "Maximum parallel jobs ($MAX_PARALLEL_JOBS) reached, waiting..." "MAIN"
             sleep 1
 
-            # Check how many jobs are still running
+            # Check how many jobs are still running and kill stuck ones
             running_jobs=0
             for pokemon_check in "${POKEMON_LIST[@]}"; do
                 local status_file="${DATA_DIR}/${pokemon_check}.status"
@@ -274,6 +343,14 @@ manage_parallel_jobs() {
                     if [ "$status" = "RUNNING" ]; then
                         ((running_jobs++))
                     fi
+                fi
+            done
+
+            # Kill any zombie processes
+            for pid in "${job_pids[@]}"; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    # Process is dead, remove from tracking
+                    continue
                 fi
             done
         done
@@ -291,6 +368,9 @@ manage_parallel_jobs() {
 
     # Wait for all jobs to complete
     wait_for_jobs "${job_pids[@]}"
+
+    # Remove cleanup trap as jobs completed normally
+    trap - EXIT INT TERM
 }
 
 # Main execution
@@ -299,6 +379,7 @@ echo "Target directory: $DATA_DIR"
 echo "Error log: $ERROR_LOG"
 echo "Success log: $SUCCESS_LOG"
 echo "Max parallel jobs: $MAX_PARALLEL_JOBS"
+echo "Job timeout: ${JOB_TIMEOUT}s"
 echo "Max retries per Pokémon: $MAX_RETRIES"
 echo "Pokémon to fetch: ${POKEMON_LIST[*]}"
 echo "----------------------------------------"
