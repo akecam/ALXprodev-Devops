@@ -1,0 +1,21 @@
+#!/bin/bash
+
+if [ -z $1 ]
+then
+    echo "Usage: $0 <pokeman pikachu>"
+    exit 1
+fi
+
+API_LINK="https://pokeapi.co/api/v2/pokemon/$1"
+OUTPUT_FILE="data.json"
+ERROR_FILE="errors.txt"
+
+curl -s -f $API_LINK -o $OUTPUT_FILE
+
+
+if [ $? -eq 0 ]
+then
+    echo "Data saved to $OUTPUT_FILE"
+else
+    echo "[$(date +%Y-%m-%d %H:%M:%S)] Error: Failed to fetch data from $API_LINK" >> "$ERROR_FILE"
+fi
