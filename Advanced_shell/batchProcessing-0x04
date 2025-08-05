@@ -1,0 +1,358 @@
+#!/bin/bash
+
+# Parallel Pokémon Data Fetching Script
+# Fetches data for multiple Pokémon using parallel processing with background jobs
+
+# Configuration
+POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
+API_BASE="https://pokeapi.co/api/v2/pokemon"
+DATA_DIR="pokemon_data"
+ERROR_LOG="pokemon_parallel_errors.log"
+SUCCESS_LOG="pokemon_parallel_success.log"
+MAX_RETRIES=3
+RETRY_DELAY=2
+MAX_PARALLEL_JOBS=5
+
+# Create the data directory if it doesn't exist
+if [ ! -d "$DATA_DIR" ]; then
+    mkdir -p "$DATA_DIR"
+fi
+
+# Initialize logs with timestamp
+echo "=== Parallel Pokémon Processing Error Log - $(date) ===" > "$ERROR_LOG"
+echo "=== Parallel Pokémon Processing Success Log - $(date) ===" > "$SUCCESS_LOG"
+
+# Function to log errors with timestamp and PID
+log_error() {
+    local message="$1"
+    local pokemon="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PID:$$] ERROR [$pokemon]: $message" | tee -a "$ERROR_LOG"
+}
+
+# Function to log success with timestamp and PID
+log_success() {
+    local message="$1"
+    local pokemon="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PID:$$] SUCCESS [$pokemon]: $message" | tee -a "$SUCCESS_LOG"
+}
+
+# Function to log info messages
+log_info() {
+    local message="$1"
+    local pokemon="${2:-MAIN}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PID:$$] INFO [$pokemon]: $message"
+}
+
+# Function to validate JSON response
+validate_json() {
+    local file="$1"
+
+    # Check if file exists and is not empty
+    if [ ! -s "$file" ]; then
+        return 1
+    fi
+
+    # Check if it's valid JSON and contains expected Pokémon data
+    if jq -e '.name and .height and .weight' "$file" >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to get HTTP status code
+get_http_status() {
+    local url="$1"
+    curl -s -o /dev/null -w "%{http_code}" "$url" --connect-timeout 10 --max-time 30
+}
+
+# Function to fetch a single Pokémon (runs in background process)
+fetch_pokemon_parallel() {
+    local pokemon_name="$1"
+    local api_url="${API_BASE}/${pokemon_name}"
+    local output_file="${DATA_DIR}/${pokemon_name}.json"
+    local temp_file="${output_file}.tmp"
+    local status_file="${DATA_DIR}/${pokemon_name}.status"
+    local attempt=1
+    local retry_delay=$RETRY_DELAY
+
+    log_info "Starting parallel fetch for $pokemon_name" "$pokemon_name"
+
+    # Create status file to track this job
+    echo "RUNNING" > "$status_file"
+
+    while [ $attempt -le $MAX_RETRIES ]; do
+        log_info "Attempt $attempt/$MAX_RETRIES" "$pokemon_name"
+
+        # Remove any existing temp file
+        [ -f "$temp_file" ] && rm "$temp_file"
+
+        # First check if the endpoint is reachable
+        local http_status=$(get_http_status "$api_url")
+
+        case "$http_status" in
+            "000")
+                log_error "Network connectivity issue (attempt $attempt)" "$pokemon_name"
+                ;;
+            "404")
+                log_error "Pokémon not found (HTTP 404) - skipping retries" "$pokemon_name"
+                echo "FAILED" > "$status_file"
+                return 1
+                ;;
+            "429")
+                log_error "Rate limit exceeded (attempt $attempt)" "$pokemon_name"
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                    log_info "Rate limited, waiting $((retry_delay * 2)) seconds before retry" "$pokemon_name"
+                    sleep $((retry_delay * 2))
+                fi
+                ;;
+            "5"*)
+                log_error "Server error (HTTP $http_status, attempt $attempt)" "$pokemon_name"
+                ;;
+            "200")
+                # HTTP 200 OK, proceed with download
+                if curl -s -f --connect-timeout 10 --max-time 30 "$api_url" -o "$temp_file" 2>/dev/null; then
+                    # Validate the downloaded JSON
+                    if validate_json "$temp_file"; then
+                        # Move temp file to final location
+                        mv "$temp_file" "$output_file"
+                        log_success "Data saved to ${output_file}" "$pokemon_name"
+                        echo "SUCCESS" > "$status_file"
+                        return 0
+                    else
+                        log_error "Invalid JSON received (attempt $attempt)" "$pokemon_name"
+                        [ -f "$temp_file" ] && rm "$temp_file"
+                    fi
+                else
+                    log_error "Download failed (attempt $attempt)" "$pokemon_name"
+                fi
+                ;;
+            *)
+                log_error "Unexpected HTTP status $http_status (attempt $attempt)" "$pokemon_name"
+                ;;
+        esac
+
+        # Clean up any partial download
+        [ -f "$temp_file" ] && rm "$temp_file"
+
+        # If not the last attempt, wait before retrying
+        if [ $attempt -lt $MAX_RETRIES ]; then
+            log_info "Retrying in $retry_delay seconds" "$pokemon_name"
+            sleep $retry_delay
+            # Exponential backoff: increase delay for next potential retry
+            retry_delay=$((retry_delay + 1))
+        fi
+
+        ((attempt++))
+    done
+
+    # All retries failed
+    log_error "All retry attempts failed after $MAX_RETRIES attempts" "$pokemon_name"
+    echo "FAILED" > "$status_file"
+
+    # Remove any existing output file from previous runs
+    [ -f "$output_file" ] && rm "$output_file"
+
+    return 1
+}
+
+# Function to check network connectivity
+check_network() {
+    log_info "Checking network connectivity" "MAIN"
+    if curl -s --connect-timeout 5 --max-time 10 "https://pokeapi.co" >/dev/null; then
+        log_info "Network connectivity confirmed" "MAIN"
+        return 0
+    else
+        log_error "Network connectivity check failed" "MAIN"
+        return 1
+    fi
+}
+
+# Function to wait for all background jobs to complete
+wait_for_jobs() {
+    local job_pids=("$@")
+    local completed=0
+    local total=${#job_pids[@]}
+
+    log_info "Waiting for $total parallel jobs to complete" "MAIN"
+
+    # Show progress while waiting
+    while [ $completed -lt $total ]; do
+        completed=0
+        for pokemon in "${POKEMON_LIST[@]}"; do
+            local status_file="${DATA_DIR}/${pokemon}.status"
+            if [ -f "$status_file" ]; then
+                local status=$(cat "$status_file")
+                if [ "$status" = "SUCCESS" ] || [ "$status" = "FAILED" ]; then
+                    ((completed++))
+                fi
+            fi
+        done
+
+        if [ $completed -lt $total ]; then
+            echo "Progress: $completed/$total jobs completed. Waiting..."
+            sleep 2
+        fi
+    done
+
+    # Wait for all background processes to finish properly
+    for pid in "${job_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    log_info "All parallel jobs completed" "MAIN"
+}
+
+# Function to display final statistics
+display_statistics() {
+    local successful=0
+    local failed=0
+    local total=${#POKEMON_LIST[@]}
+
+    echo ""
+    echo "=== PARALLEL PROCESSING RESULTS ==="
+
+    for pokemon in "${POKEMON_LIST[@]}"; do
+        local status_file="${DATA_DIR}/${pokemon}.status"
+        if [ -f "$status_file" ]; then
+            local status=$(cat "$status_file")
+            case "$status" in
+                "SUCCESS")
+                    echo "✅ $pokemon: Successfully downloaded"
+                    ((successful++))
+                    ;;
+                "FAILED")
+                    echo "❌ $pokemon: Failed to download"
+                    ((failed++))
+                    ;;
+                *)
+                    echo "⚠️  $pokemon: Unknown status ($status)"
+                    ((failed++))
+                    ;;
+            esac
+        else
+            echo "❓ $pokemon: No status file found"
+            ((failed++))
+        fi
+    done
+
+    echo ""
+    echo "=== FINAL STATISTICS ==="
+    echo "Total Pokémon processed: $total"
+    echo "Successful downloads: $successful"
+    echo "Failed downloads: $failed"
+
+    if [ $failed -gt 0 ]; then
+        echo "⚠️  Check $ERROR_LOG for detailed error information"
+    fi
+
+    # Show success rate
+    local success_rate=$((successful * 100 / total))
+    echo "Success rate: $success_rate%"
+
+    # Clean up status files
+    rm -f "$DATA_DIR"/*.status
+}
+
+# Function to control parallel job execution
+manage_parallel_jobs() {
+    local job_pids=()
+    local running_jobs=0
+
+    for pokemon in "${POKEMON_LIST[@]}"; do
+        # Wait if we've reached the maximum number of parallel jobs
+        while [ $running_jobs -ge $MAX_PARALLEL_JOBS ]; do
+            log_info "Maximum parallel jobs ($MAX_PARALLEL_JOBS) reached, waiting..." "MAIN"
+            sleep 1
+
+            # Check how many jobs are still running
+            running_jobs=0
+            for pokemon_check in "${POKEMON_LIST[@]}"; do
+                local status_file="${DATA_DIR}/${pokemon_check}.status"
+                if [ -f "$status_file" ]; then
+                    local status=$(cat "$status_file")
+                    if [ "$status" = "RUNNING" ]; then
+                        ((running_jobs++))
+                    fi
+                fi
+            done
+        done
+
+        # Start the background job
+        log_info "Starting parallel fetch for $pokemon" "MAIN"
+        fetch_pokemon_parallel "$pokemon" &
+        local job_pid=$!
+        job_pids+=($job_pid)
+        ((running_jobs++))
+
+        # Small delay to prevent overwhelming the API
+        sleep 0.2
+    done
+
+    # Wait for all jobs to complete
+    wait_for_jobs "${job_pids[@]}"
+}
+
+# Main execution
+echo "Starting parallel Pokémon data retrieval..."
+echo "Target directory: $DATA_DIR"
+echo "Error log: $ERROR_LOG"
+echo "Success log: $SUCCESS_LOG"
+echo "Max parallel jobs: $MAX_PARALLEL_JOBS"
+echo "Max retries per Pokémon: $MAX_RETRIES"
+echo "Pokémon to fetch: ${POKEMON_LIST[*]}"
+echo "----------------------------------------"
+
+# Record start time
+start_time=$(date +%s)
+
+# Check network connectivity first
+if ! check_network; then
+    echo "❌ Cannot proceed without network connectivity"
+    exit 1
+fi
+
+# Clean up any previous status files
+rm -f "$DATA_DIR"/*.status
+
+# Start parallel processing
+log_info "Initiating parallel processing" "MAIN"
+manage_parallel_jobs
+
+# Calculate processing time
+end_time=$(date +%s)
+processing_time=$((end_time - start_time))
+
+echo "----------------------------------------"
+echo "Parallel processing completed in $processing_time seconds"
+
+# Display statistics and results
+display_statistics
+successful_downloads=0
+total_pokemon=${#POKEMON_LIST[@]}
+
+# Count successful downloads
+for pokemon in "${POKEMON_LIST[@]}"; do
+    if [ -f "$DATA_DIR/${pokemon}.json" ]; then
+        ((successful_downloads++))
+    fi
+done
+
+# Display directory contents if there are successful downloads
+if [ $successful_downloads -gt 0 ] && [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR/*.json 2>/dev/null)" ]; then
+    echo ""
+    echo "Files created in $DATA_DIR:"
+    ls -la "$DATA_DIR"/*.json 2>/dev/null | awk '{print "  " $9 " (" $5 " bytes)"}'
+fi
+
+# Exit with appropriate code
+if [ $successful_downloads -eq $total_pokemon ]; then
+    echo "🎉 All Pokémon data retrieved successfully in parallel!"
+    exit 0
+elif [ $successful_downloads -gt 0 ]; then
+    echo "⚠️  Partial success: $successful_downloads/$total_pokemon Pokémon retrieved"
+    exit 1
+else
+    echo "❌ No Pokémon data could be retrieved"
+    exit 2
+fi

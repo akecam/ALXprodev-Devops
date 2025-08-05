@@ -1,47 +1,189 @@
 #!/bin/bash
 
-# Batch Pokémon Data Retrieval Script
-# Fetches data for multiple Pokémon and saves each to separate files
+# Enhanced Batch Pokémon Data Retrieval Script
+# Fetches data for multiple Pokémon with retry logic and robust error handling
 
-# List of Pokémon to fetch
+# Configuration
 POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
-
-# Base API URL
 API_BASE="https://pokeapi.co/api/v2/pokemon"
-
-# Directory to store Pokémon data
 DATA_DIR="pokemon_data"
+ERROR_LOG="pokemon_errors.log"
+MAX_RETRIES=3
+RETRY_DELAY=2
 
 # Create the data directory if it doesn't exist
 if [ ! -d "$DATA_DIR" ]; then
     mkdir -p "$DATA_DIR"
 fi
 
-# Function to fetch Pokémon data
-fetch_pokemon() {
-    local pokemon_name="$1"
-    local api_url="${API_BASE}/${pokemon_name}"
-    local output_file="${DATA_DIR}/${pokemon_name}.json"
+# Initialize error log with timestamp
+echo "=== Pokémon Batch Processing Error Log - $(date) ===" > "$ERROR_LOG"
 
-    echo "Fetching data for ${pokemon_name}..."
+# Function to log errors with timestamp
+log_error() {
+    local message="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $message" | tee -a "$ERROR_LOG"
+}
 
-    # Use curl to fetch data with error handling
-    if curl -s -f "$api_url" -o "$output_file"; then
-        echo "Saved data to ${output_file} ✅"
-    else
-        echo "❌ Failed to fetch data for ${pokemon_name}"
-        # Remove the empty file if curl failed
-        [ -f "$output_file" ] && rm "$output_file"
+# Function to log info messages
+log_info() {
+    local message="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $message"
+}
+
+# Function to validate JSON response
+validate_json() {
+    local file="$1"
+
+    # Check if file exists and is not empty
+    if [ ! -s "$file" ]; then
         return 1
     fi
 
-    return 0
+    # Check if it's valid JSON and contains expected Pokémon data
+    if jq -e '.name and .height and .weight' "$file" >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to get HTTP status code
+get_http_status() {
+    local url="$1"
+    curl -s -o /dev/null -w "%{http_code}" "$url" --connect-timeout 10 --max-time 30
+}
+
+# Enhanced function to fetch Pokémon data with retry logic
+fetch_pokemon_with_retry() {
+    local pokemon_name="$1"
+    local api_url="${API_BASE}/${pokemon_name}"
+    local output_file="${DATA_DIR}/${pokemon_name}.json"
+    local temp_file="${output_file}.tmp"
+    local attempt=1
+
+    echo "Fetching data for ${pokemon_name}..."
+
+    while [ $attempt -le $MAX_RETRIES ]; do
+        log_info "Attempt $attempt/$MAX_RETRIES for $pokemon_name"
+
+        # Remove any existing temp file
+        [ -f "$temp_file" ] && rm "$temp_file"
+
+        # First check if the endpoint is reachable
+        local http_status=$(get_http_status "$api_url")
+
+        case "$http_status" in
+            "000")
+                log_error "Network connectivity issue for $pokemon_name (attempt $attempt)"
+                ;;
+            "404")
+                log_error "Pokémon '$pokemon_name' not found (HTTP 404) - skipping retries"
+                return 1
+                ;;
+            "429")
+                log_error "Rate limit exceeded for $pokemon_name (attempt $attempt)"
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                    echo "  Rate limited, waiting $(($RETRY_DELAY * 2)) seconds before retry..."
+                    sleep $(($RETRY_DELAY * 2))
+                fi
+                ;;
+            "5"*)
+                log_error "Server error (HTTP $http_status) for $pokemon_name (attempt $attempt)"
+                ;;
+            "200")
+                # HTTP 200 OK, proceed with download
+                if curl -s -f --connect-timeout 10 --max-time 30 "$api_url" -o "$temp_file" 2>/dev/null; then
+                    # Validate the downloaded JSON
+                    if validate_json "$temp_file"; then
+                        # Move temp file to final location
+                        mv "$temp_file" "$output_file"
+                        echo "  ✅ Saved data to ${output_file}"
+                        log_info "Successfully fetched $pokemon_name"
+                        return 0
+                    else
+                        log_error "Invalid JSON received for $pokemon_name (attempt $attempt)"
+                        [ -f "$temp_file" ] && rm "$temp_file"
+                    fi
+                else
+                    log_error "Download failed for $pokemon_name (attempt $attempt)"
+                fi
+                ;;
+            *)
+                log_error "Unexpected HTTP status $http_status for $pokemon_name (attempt $attempt)"
+                ;;
+        esac
+
+        # Clean up any partial download
+        [ -f "$temp_file" ] && rm "$temp_file"
+
+        # If not the last attempt, wait before retrying
+        if [ $attempt -lt $MAX_RETRIES ]; then
+            echo "  Retrying in $RETRY_DELAY seconds..."
+            sleep $RETRY_DELAY
+            # Exponential backoff: increase delay for next potential retry
+            RETRY_DELAY=$((RETRY_DELAY + 1))
+        fi
+
+        ((attempt++))
+    done
+
+    # All retries failed
+    echo "  ❌ Failed to fetch data for ${pokemon_name} after $MAX_RETRIES attempts"
+    log_error "All retry attempts failed for $pokemon_name"
+
+    # Remove any existing output file from previous runs
+    [ -f "$output_file" ] && rm "$output_file"
+
+    return 1
+}
+
+# Function to check network connectivity
+check_network() {
+    echo "Checking network connectivity..."
+    if curl -s --connect-timeout 5 --max-time 10 "https://pokeapi.co" >/dev/null; then
+        echo "✅ Network connectivity confirmed"
+        return 0
+    else
+        echo "❌ Network connectivity issue detected"
+        log_error "Network connectivity check failed"
+        return 1
+    fi
+}
+
+# Function to display final statistics
+display_statistics() {
+    local successful="$1"
+    local total="$2"
+    local failed=$((total - successful))
+
+    echo ""
+    echo "=== BATCH PROCESSING STATISTICS ==="
+    echo "Total Pokémon processed: $total"
+    echo "Successful downloads: $successful"
+    echo "Failed downloads: $failed"
+
+    if [ $failed -gt 0 ]; then
+        echo "⚠️  Check $ERROR_LOG for detailed error information"
+    fi
+
+    # Show success rate
+    local success_rate=$((successful * 100 / total))
+    echo "Success rate: $success_rate%"
 }
 
 # Main execution
-echo "Starting batch Pokémon data retrieval..."
+echo "Starting enhanced batch Pokémon data retrieval..."
 echo "Target directory: $DATA_DIR"
+echo "Error log: $ERROR_LOG"
+echo "Max retries per Pokémon: $MAX_RETRIES"
 echo "----------------------------------------"
+
+# Check network connectivity first
+if ! check_network; then
+    echo "❌ Cannot proceed without network connectivity"
+    exit 1
+fi
 
 # Counter for successful downloads
 successful_downloads=0
@@ -49,21 +191,40 @@ total_pokemon=${#POKEMON_LIST[@]}
 
 # Loop through the Pokémon list
 for pokemon in "${POKEMON_LIST[@]}"; do
-    if fetch_pokemon "$pokemon"; then
+    # Reset retry delay for each Pokémon
+    RETRY_DELAY=2
+
+    if fetch_pokemon_with_retry "$pokemon"; then
         ((successful_downloads++))
     fi
 
-    # Add a small delay to avoid rate limiting (1 second)
-    sleep 1
+    # Add a delay between different Pokémon to be respectful to the API
+    if [ "$pokemon" != "${POKEMON_LIST[-1]}" ]; then
+        echo "  Waiting 1 second before next Pokémon..."
+        sleep 1
+    fi
+
+    echo ""
 done
 
 echo "----------------------------------------"
-echo "Batch processing complete!"
-echo "Successfully downloaded: $successful_downloads/$total_pokemon Pokémon"
+display_statistics $successful_downloads $total_pokemon
 
-# Display directory contents
-if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then
+# Display directory contents if there are successful downloads
+if [ $successful_downloads -gt 0 ] && [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR/*.json 2>/dev/null)" ]; then
     echo ""
     echo "Files created in $DATA_DIR:"
     ls -la "$DATA_DIR"/*.json 2>/dev/null | awk '{print "  " $9 " (" $5 " bytes)"}'
+fi
+
+# Exit with appropriate code
+if [ $successful_downloads -eq $total_pokemon ]; then
+    echo "🎉 All Pokémon data retrieved successfully!"
+    exit 0
+elif [ $successful_downloads -gt 0 ]; then
+    echo "⚠️  Partial success: $successful_downloads/$total_pokemon Pokémon retrieved"
+    exit 1
+else
+    echo "❌ No Pokémon data could be retrieved"
+    exit 2
 fi
