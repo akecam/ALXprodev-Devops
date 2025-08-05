@@ -6,17 +6,29 @@ if [ ! -f data.json ]; then
   exit 1
 fi
 
-jq -r '
-  .name as $name |
-  (.types[] | select(.slot == 1) | .type.name) as $type |
-  .weight as $weight |
-  .height as $height |
-  "\($name) \($type) \($weight) \($height)"
-' data.json |
-awk '{
-  name = toupper(substr($1,1,1)) substr($1,2);
-  type = toupper(substr($2,1,1)) substr($2,2);
-  weight = $3 / 10 "kg";
-  height = $4 / 10 "m";
-  printf "%s is of type %s, weighs %s, and is %s tall.\n", name, type, weight, height;
-}'
+# Use jq to extract raw fields
+raw_output=$(jq -r '
+  .name,
+  (.types[] | select(.slot == 1) | .type.name),
+  .weight,
+  .height
+' data.json)
+
+# Use awk to assign variables and convert units
+readarray -t lines <<< "$raw_output"
+
+name="${lines[0]}"
+type="${lines[1]}"
+weight="${lines[2]}"
+height="${lines[3]}"
+
+# Convert weight from decagrams to kg, height from decimeters to meters
+formatted_weight=$(awk "BEGIN {printf \"%.1f\", $weight / 10}")
+formatted_height=$(awk "BEGIN {printf \"%.1f\", $height / 10}")
+
+# Capitalize name and type using sed
+name=$(echo "$name" | sed -E 's/^(.)/\U\1/')
+type=$(echo "$type" | sed -E 's/^(.)/\U\1/')
+
+# Print formatted output
+echo "$name is of type $type, weighs ${formatted_weight}kg, and is ${formatted_height}m tall."
