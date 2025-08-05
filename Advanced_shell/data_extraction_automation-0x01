@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Ensure the data.json file exists
+if [ ! -f data.json ]; then
+  echo "Error: data.json not found. Please run the API fetch script first."
+  exit 1
+fi
+
+jq -r '
+  .name as $name |
+  (.types[] | select(.slot == 1) | .type.name) as $type |
+  .weight as $weight |
+  .height as $height |
+  "\($name) \($type) \($weight) \($height)"
+' data.json |
+awk '{
+  name = toupper(substr($1,1,1)) substr($1,2);
+  type = toupper(substr($2,1,1)) substr($2,2);
+  weight = $3 / 10 "kg";
+  height = $4 / 10 "m";
+  printf "%s is of type %s, weighs %s, and is %s tall.\n", name, type, weight, height;
+}'
